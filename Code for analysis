@@ -1,0 +1,250 @@
+Code for analysis
+
+# install and load package-------------------------------------------------------------------------
+load_my_packages <- function() {
+  # install
+  if (!require("pacman")) install.packages("pacman")
+  
+  # install and load
+  pacman::p_load(
+    tidyverse, lubridate, zoo, data.table,       
+    survival, survminer, ggsurvfit, tidycmprsk, cmprsk, rms, smoothHR, riskRegression, coxme, 
+    lmtest, epiR, interactionR, ipw, WeightIt, EValue, 
+    caret, xgboost,                            
+    ggsci, hrbrthemes, viridis, corrplot, patchwork,  
+    openxlsx, tableone, table1, forestplot, Cairo, showtext, 
+    boot, trend, fdrtool, qgcomp, missForest, AER, broom, wCorr, polycor 
+  )
+}
+
+load_my_packages()
+# read and combine data-------------------------------------------------------------------------
+Covariates <-readRDS("D:/xxx/Covariates.rds") 
+Exposure <-readRDS("D:/xxx/Exposure.rds") 
+Outcome <- readRDS("D:/xxx/Outcomes.rds") 
+
+data_list <- list(Covariates, Exposure, Outcome)
+anlaysis_data <- reduce(data_list, ~ full_join(.x, .y, by = "id"))
+
+# function
+factor_relevel <- function(data, var, ref) {
+  print(table(data[[var]]))
+  data[[var]] <- relevel(as.factor(data[[var]]), ref)
+  return(data)
+}
+
+# treat variables
+anlaysis_data1 <- anlaysis_data |>
+  (\(d) {
+    d <- factor_relevel(d, "Sex", "1")
+    d <- factor_relevel(d, "Ethnic", "2")
+    d <- factor_relevel(d, "Smoking", "1")
+    d <- factor_relevel(d, "Alcohol.drinker.status", "1")
+    d <- factor_relevel(d, "Education", "1")
+    d <- factor_relevel(d, "diet_score", "1")
+    d <- factor_relevel(d, "Employment", "2")
+    d <- factor_relevel(d, "Income", "1")
+    d <- factor_relevel(d, "physical_activity", "1")
+    d <- factor_relevel(d, "diabetes", "1")
+    d <- factor_relevel(d, "hypertension", "1")
+    d <- factor_relevel(d, "hyperlipidemia", "1")
+    d
+  })()
+
+# baseline characteristics-------------------------------------------------------------------------
+table1_data <- anlaysis_data1
+
+##
+tab1 <- CreateTableOne(vars = myVars, data = table1_data, 
+                       strata = "outcome")
+
+table_1 <- print(tab1,quote = FALSE,
+                 contDigits = 2, catDigits=2, pDigits=3, noSpaces = TRUE,
+                 printToggle = FALSE, 
+                 showAllLevels = FALSE)
+
+write.csv(table_1,"table1_group.csv")
+
+tab1_all <- CreateTableOne(vars = myVars, data = table1_data)
+
+tab1_all <- print(tab1_all,quote = FALSE, 
+                  cpartontDigits = 2, catDigits=2, pDigits=3,noSpaces = TRUE,
+                  printToggle = FALSE, 
+                  showAllLevels = FALSE)
+
+write.csv(tab1_all,"tab1_all_all.csv")
+
+# Regression model-------------------------------------------------------------------------
+AP <- c("PM25", "PM10", "NO2", "NOx")
+
+
+Cox_results <- map_dfr(AP, function(i) {
+  fit <- coxph(Surv(time_interval_year, outcome) ~ get(i) + 
+                 Age + Sex + Education + Employment + 
+                 Alcohol.drinker.status + Smoking + BMI +
+                 diet_score + physical_activity + TDI + Income + Ethnic +
+                 diabetes + hypertension + hyperlipidemia,
+               data = anlaysis_data1)
+  
+  s <- summary(fit)
+  
+  tibble(
+    pollutant = i,
+    HR = sprintf("%.2f (%.2f, %.2f)", 
+                 s$conf.int[1,1], s$conf.int[1,3], s$conf.int[1,4]),
+    P_value = s$coefficients[1,5]
+  )
+}) 
+
+#combine table
+Cox_results_all <- rbind(
+  Cox_results1, "", Cox_results2, "", Cox_results3, "", 
+  Cox_results4, "", Cox_results5)
+
+Cox_results_all
+
+write.csv(Cox_results_all, "Cox_results_all.csv")
+
+# RCS-------------------------------------------------------------------------
+anlaysis_data1.1 <- anlaysis_data1
+dd <- datadist(anlaysis_data1.1)
+options(datadist = "dd")
+
+# function
+run_rcs <- function(data, exposure, knots = 3, cutoff, color, xlab, 
+                    outfile, text_x, text_y, p_nonlin) {
+  
+  # mode
+  fit <- cph(Surv(time_interval_year, outcome) ~ 
+               rcs(get(exposure), knots) + 
+               Age + Sex + Education + Employment + Alcohol.drinker.status +
+               Smoking + BMI + diet_score + physical_activity +
+               TDI + Income + Ethnic + diabetes + hypertension + hyperlipidemia,
+             x = TRUE, y = TRUE, data = data)
+  
+  # 
+  print(anova(fit))  
+  print(BIC(fit))
+  
+  # 
+  Pre <- rms::Predict(fit, get(exposure), fun = exp, type = "predictions", 
+                      ref.zero = TRUE, conf.int = 0.95, digits = 2)
+  
+  # 
+  p <- ggplot() +
+    geom_line(data = Pre,
+              aes_string(x = exposure, y = "yhat"),
+              linetype = "solid", size = 1.2, alpha = 0.7, colour = color) +
+    geom_ribbon(data = Pre,
+                aes_string(x = exposure, ymin = "lower", ymax = "upper"),
+                alpha = 0.1, fill = color) +
+    geom_hline(yintercept = 1, linetype = 2, size = 0.75) +
+    annotate("text", x = -Inf, y = Inf, 
+             label = paste0("P for non-linearity = ", p_nonlin),
+             colour = "black", size = 5, fontface = "italic", 
+             hjust = -0.1, vjust = 1.5) +
+    labs(x = xlab, y = "HRs and 95%CIs") +
+    theme_classic() +
+    theme(plot.title = element_text(size = 21, face = "bold"),
+          text = element_text(size = 20),
+          axis.text.x = element_text(size = 18, colour = "black"),
+          axis.text.y = element_text(size = 18, colour = "black"),
+          legend.position = "none")
+  
+  return(p)
+}
+
+plots <- list(
+  # PM2.5 
+  run_rcs(anlaysis_data1.1, exposure = "PM2.5", 
+          color = "#1597A5", xlab = expression(PM[2.5]~(mu*g/m^3)),
+          outfile = "PM25_RCS.csv", p_nonlin = "0.001", title_label = "(A)"),
+  
+  # PM10
+  run_rcs(anlaysis_data1.1, exposure = "PM10", 
+          color = "#FFC24B", xlab = expression(PM[10]~(mu*g/m^3)),
+          outfile = "PM10_RCS.csv", p_nonlin = "0.565", title_label = "(B)"),
+  
+  # NO2
+  run_rcs(anlaysis_data1.1, exposure = "NO2", 
+          color = "#F66F69", xlab = expression(NO[2]~(mu*g/m^3)),
+          outfile = "NO2_RCS.csv", p_nonlin = "0.203", title_label = "(C)"),
+  
+  # NOx
+  run_rcs(anlaysis_data1.1, exposure = "NOx", 
+          color = "#90C9E7", xlab = expression(NO[x]~(mu*g/m^3)),
+          outfile = "NOx_RCS.csv", p_nonlin = "0.378", title_label = "(D)")
+)
+
+
+# patch pictures
+RCS <- wrap_plots(plots)
+ggsave("AS.pdf", RCS, scale = 3, dpi = 300, width = 10, height = 8)
+
+# Combine effects ----------------------------------------------------------
+
+# labels
+xlab_levels <- c(
+  "AP-T1 & Low GRS", "AP-T2 & Low GRS", "AP-T3 & Low GRS",
+  "AP-T1 & Intermediate GRS", "AP-T2 & Intermediate GRS", "AP-T3 & Intermediate GRS",
+  "AP-T1 & High GRS", "AP-T2 & High GRS", "AP-T3 & High GRS"
+)
+
+# read data
+df_plot <- read.csv("FOREST.CSV", header = T) %>%
+  mutate(
+    pollutants_label = case_when(
+      pollutants == "PM2.5" ~ "'(A) PM'[2.5]",
+      pollutants == "PM10"  ~ "'(B) PM'[10]",
+      pollutants == "NO2"   ~ "'(C) NO'[2]",
+      pollutants == "NOx"   ~ "'(D) NO'[x]"
+    ),
+    pollutants_label = factor(pollutants_label, levels = c("'(A) PM'[2.5]", "'(B) PM'[10]", "'(C) NO'[2]", "'(D) NO'[x]")),
+    xlab = factor(xlab, levels = rev(xlab_levels)),
+    GRS_group = case_when(
+      grepl("Low GRS", xlab) ~ "Low GRS",
+      grepl("Intermediate GRS", xlab) ~ "Intermediate GRS",
+      grepl("High GRS", xlab) ~ "High GRS"
+    ),
+    GRS_group = factor(GRS_group, levels = c("Low GRS", "Intermediate GRS", "High GRS")),
+    AP_level = case_when(
+      grepl("AP-T1", xlab) ~ 1,
+      grepl("AP-T2", xlab) ~ 2,
+      grepl("AP-T3", xlab) ~ 3
+    )
+  )
+
+new_macaron_colors <- c("Low GRS" = "#7B92A8",          
+                        "Intermediate GRS" = "#E9C46A", 
+                        "High GRS" = "#C27D7F")        
+
+p <- ggplot(df_plot, aes(x = exp.coef., y = xlab, color = GRS_group)) + 
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50", size = 0.6) +
+  geom_errorbarh(aes(xmin = lower..95, xmax = upper..95, alpha = AP_level), 
+                 height = 0.25, size = 1.5) + 
+  geom_point(aes(alpha = AP_level), size = 6) + 
+  facet_wrap(~ pollutants_label, nrow = 2, scales = "free_x", labeller = label_parsed) +
+  geom_text(aes(x = Inf, y = Inf, label = "Group P for trend < 2.20E-16"),
+            hjust = 1.1, vjust = 1.5, 
+            size = 5,             
+            fontface = "italic",   
+            color = "black", 
+            check_overlap = TRUE) +
+  scale_color_manual(values = new_macaron_colors) +
+  scale_alpha_continuous(range = c(0.5, 1), guide = "none") +
+  labs(x = "HRs (95% CIs)", y = NULL) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "white", color = "black"),
+    strip.text = element_text(size = 20, face = "bold"), 
+    axis.text.y = element_text(size = 16, color = "black"), 
+    axis.text.x = element_text(size = 16, color = "black"),
+    axis.title.x = element_text(size = 23, margin = margin(t = 10)),
+    
+    legend.position = "none" 
+  )
+
+print(p)
+
+ggsave("Fig1.pdf", width = 14, height = 10)
